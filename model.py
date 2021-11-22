@@ -162,11 +162,11 @@ class BertDot(BaseModelDot,nn.Module):
         self.apply(self._init_weights)
 
     def update_query(self,emb_query,emb_doc):
-        query_embedding = emb_query.unsqueeze(1)
-        doc_embedding = emb_doc.unsqueeze(1)
+        query_embedding = emb_query.unsqueeze(0)
+        doc_embedding = emb_doc.unsqueeze(0)
         out = self.bidafa_layer(query_embedding,doc_embedding)
         update_query = self.reduced_dim(out)
-        return update_query.squeeze(1)
+        return update_query.squeeze(0)
 
     def _text_encode(self, input_ids, attention_mask):
         outputs1 = self.electra(input_ids=input_ids,attention_mask=attention_mask)

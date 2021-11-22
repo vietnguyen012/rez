@@ -8,6 +8,8 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.data.sampler import SequentialSampler
 logger = logging.Logger(__name__)
 from tqdm import tqdm
+from retrieve_utils import index_retrieve,construct_flatindex_from_embeddings,convert_index_to_gpu
+import faiss
 
 def prediction(model, data_collator, args, test_dataset, embedding_memmap, ids_memmap, is_query):
     os.makedirs(args.output_dir, exist_ok=True)
@@ -96,29 +98,13 @@ class State:
         self.query = query_embedding
         self.index = index 
 
-
-transformer_model = torch.nn.Transformer(nhead=12, num_encoder_layers=3,d_model=768).to("cuda")
-def update(query_embedding,doc_embedding,selected_idx,device):
-    # update_query = torch.einsum("qih,idh->qdh",query_embedding.unsqueeze(1),  
-    #     doc_embedding[selected_idx.view(-1)].unsqueeze(0))
-    # update_query = rearrange(update_query,"qdh->(qd)h")
-
-    query_embedding = query_embedding.unsqueeze(1)
-    doc_embedding = doc_embedding[selected_idx.view(-1)].unsqueeze(1)
-    # q,i,h = query_embedding.size()
-    # i,d,h = doc_embedding.size()
-    # update_query = torch.bmm(query_embedding.view(h,q,i),doc_embedding.view(h,i,d)).view(q,d,h).sum(1)
-
-    out = transformer_model(doc_embedding,query_embedding)
-    return out.squeeze(1)
-
 class Beam:
     batch_size:int 
     beam_size: int
     log_probs: torch.tensor
     finished: torch.tensor  
     state: State 
-    def __init__(self,query_embedding,doc_embedding,index,beam_size,batch_size,device):
+    def __init__(self,model,query_embedding,doc_embedding,index,beam_size,batch_size,device):
         self.query_embedding = torch.tensor(query_embedding).to(device)
         self.doc_embedding = torch.tensor(doc_embedding).to(device)
         init_state = State(self.query_embedding,index)
@@ -132,19 +118,21 @@ class Beam:
         self.query_embedding = self.tile_along_beam(self.query_embedding,self.beam_size,device)
         tiled_doc_embedding = self.tile_along_beam(self.doc_embedding,self.beam_size,device)
         tiled_nearest_neighbors = self.tile_along_beam(self.nearest_neighbors,self.beam_size,device)
-        update_query = update(self.query_embedding,tiled_doc_embedding,tiled_nearest_neighbors,device)
-        self.state = State(update_query,index)
+        tiled_doc_embedding = tiled_doc_embedding[tiled_nearest_neighbors.view(-1)]
+        up_query = model.update_query(self.query_embedding,tiled_doc_embedding)
+        self.model = model
+        self.state = State(up_query,index)
         self.n_step=0
         self.max_step = 3
-        self.pred_doc = (torch.ones((batch_size,self.max_step,self.beam_size),dtype=torch.int16)*-1).to(device)
-        self.terminated_doc_id = 11241
+        self.pred_doc = (torch.ones((batch_size,self.max_step,self.beam_size),dtype=torch.long)*-2).to(device)
+        self.terminated_doc_id = torch.tensor(-1,dtype=torch.long).to("cuda")
         for i in range(self.batch_size):
             for j in range(self.beam_size):
-                if self.n_step == self.max_step or self.nearest_neighbors[i][j] ==  self.terminated_doc_id:
-                    self.finished[i][j] = True
-                    self.pred_doc[i][self.n_step][j] = self.nearest_neighbors[i][j].item()
+                if self.n_step == self.max_step or self.nearest_neighbors[i,j] ==  self.terminated_doc_id:
+                    self.finished[i,j] = True
+                    self.pred_doc[i,self.n_step,j] = self.nearest_neighbors[i,j]
                 else:
-                    self.pred_doc[i][self.n_step][j] = self.nearest_neighbors[i][j].item()
+                    self.pred_doc[i,self.n_step,j] = self.nearest_neighbors[i,j]
 
         self.n_step += 1
         self.log_probs_cache = []
@@ -163,13 +151,10 @@ class Beam:
     def grow(self):
         nearest_neighbors,log_probs = index_retrieve(self.state.index, self.state.query,self.beam_size,self.device,batch=self.batch_size)
         x = log_probs.view(-1,self.beam_size,self.beam_size)
-        # x = torch.zeros(self.log_probs.unsqueeze(-1).expand(-1,-1,self.beam_size).size()) \
-        #     .masked_scatter(~self.finished.unsqueeze(-1).expand(-1,-1,self.beam_size),x)+ self.log_probs.unsqueeze(-1)
         x = x + self.log_probs.unsqueeze(-1)
         y = x.view(-1,self.beam_size*self.beam_size)
         values,indices = y.topk(self.beam_size,dim=-1)
         self.log_probs = values
-        # self.log_probs.masked_scatter(~self.finished, values)
         cnt = 0
         selected_query = []
         selected_doc = []
@@ -179,17 +164,17 @@ class Beam:
                 idx = indices[cnt,j].item()
                 m = cnt*self.beam_size +idx//self.beam_size
                 n = idx%self.beam_size
-                doc_id = nearest_neighbors[m][n]
-                if self.finished[i][j]:
+                doc_id = nearest_neighbors[m,n].float().long()
+                if self.finished[i,j]:
                     selected_query.append(self.state.query[idx])
                     selected_doc.append(doc_id)
                     continue
                 if self.n_step == self.max_step or doc_id ==  self.terminated_doc_id:
-                    self.finished[i][j] = True
+                    self.finished[i,j] = True
                     selected_query.append(self.state.query[idx])
                     selected_doc.append(doc_id)
                 else:
-                    self.pred_doc[i][self.n_step][j] = doc_id.item()
+                    self.pred_doc[i,self.n_step,j] = doc_id
                     selected_query.append(self.state.query[idx])
                     selected_doc.append(doc_id)
 
@@ -198,9 +183,12 @@ class Beam:
         if self.done():
             return True
         self.log_probs_cache.append(self.log_probs)
-        selected_query = torch.stack(selected_query)
-        selected_doc = torch.stack(selected_doc)
-        update_query = update(selected_query,self.doc_embedding,selected_doc,self.device)
+        selected_query = torch.stack(selected_query).to(self.device)
+        selected_doc = torch.stack(selected_doc).to(self.device).type(torch.long)
+
+        selected_doc_embedding = self.doc_embedding[selected_doc]
+
+        update_query = self.model.update_query(selected_query,selected_doc_embedding)
 
         
         self.n_step += 1
@@ -208,9 +196,40 @@ class Beam:
         return False
 
     def best_hypothesis(self):
-        res = torch.zeros((self.batch_size,self.max_step),dtype=torch.int32).to(self.device)
-        for step in range(self.max_step):
-            for i, j in enumerate(self.log_probs_cache[step].argmax(dim=-1).tolist()):
-                res[i,step] = self.pred_doc[i,step,j]
-        # print(res==self.pred_doc[:,:,0])
-        return res
+        return self.pred_doc[:,:,0]
+if __name__=='__main__':
+    from model import BertDot
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--use_mean", type=bool, default=True)
+    parser.add_argument("--not_faiss_cuda", type=bool, default=False)
+    parser.add_argument("--n_gpu", type=int, default=1)
+    parser.add_argument("--doc_memmap_path", type=str, default="./warmup_retrieve/passage.memmap")
+    parser.add_argument("--docid_memmap_path", type=str, default="./warmup_retrieve/passage_ids.memmap")
+    parser.add_argument("--query_memmap_path", type=str, default="./warmup_retrieve/query.memmap")
+    parser.add_argument("--queryid_memmap_path", type=str, default="./warmup_retrieve/query_ids.memmap")
+    args = parser.parse_args()
+    model = BertDot(args).to("cuda")
+    model.load_state_dict(torch.load("data/passage/star_train/models/checkpoint-10000/pytorch_model.bin"))
+    output_embedding_size = 768
+
+    doc_embeddings = np.memmap(args.doc_memmap_path, dtype=np.float32, mode="r")
+    doc_ids = np.memmap(args.docid_memmap_path, dtype=np.int32, mode="r")
+    doc_embeddings = doc_embeddings.reshape(-1, output_embedding_size)
+
+    query_embeddings = np.memmap(args.query_memmap_path, dtype=np.float32, mode="r")
+    query_embeddings = query_embeddings.reshape(-1, output_embedding_size)
+    query_ids = np.memmap(args.queryid_memmap_path, dtype=np.int32, mode="r")
+
+    index = construct_flatindex_from_embeddings(doc_embeddings, doc_ids)
+    if torch.cuda.is_available() and not args.not_faiss_cuda:
+        index = convert_index_to_gpu(index, list(range(args.n_gpu)), False)
+    else:
+        faiss.omp_set_num_threads(32)
+
+    query_embeddings = query_embeddings[:100]
+    beam = Beam(model,query_embeddings, doc_embeddings, index, 3, 100, "cuda")
+
+    while not beam.grow():
+        pass
+    print(beam.best_hypothesis())
